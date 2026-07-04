@@ -51,7 +51,7 @@ fi
 
 sky_key="${SKYPILOT_SSH_KEY:-}"
 if [ -z "$sky_key" ]; then
-    for candidate in "$HOME"/.sky/clients/*/ssh/sky-key; do
+    for candidate in "${HOME:-}"/.sky/clients/*/ssh/sky-key; do
         if [ -f "$candidate" ]; then
             sky_key="$candidate"
             break
