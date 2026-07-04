@@ -88,19 +88,24 @@ local_port=$(pick_port) || {
     exit 1
 }
 
+pf_pid=""
 pf_log="${TMPDIR:-/tmp}/skypilot-rsync-port-forward-${resource_name}-${local_port}.log"
+
+cleanup() {
+    if [ -n "$pf_pid" ]; then
+        kill "$pf_pid" >/dev/null 2>&1 || true
+        wait "$pf_pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pf_log" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
 if [ -z "$context" ] || [ "$context_lower" = "none" ]; then
     kubectl port-forward "$resource_type/$resource_name" -n "$namespace" --kubeconfig=/dev/null --address 127.0.0.1 "${local_port}:22" >"$pf_log" 2>&1 &
 else
     kubectl port-forward "$resource_type/$resource_name" -n "$namespace" --context="$context" --address 127.0.0.1 "${local_port}:22" >"$pf_log" 2>&1 &
 fi
 pf_pid=$!
-
-cleanup() {
-    kill "$pf_pid" >/dev/null 2>&1 || true
-    wait "$pf_pid" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT INT TERM
 
 count=0
 max_count=600
