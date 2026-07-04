@@ -130,5 +130,5 @@ MAX_WAIT_COUNT=$((MAX_WAIT_TIME_SECONDS * 2))
 
 exec ssh "${ssh_opts[@]}" sky@127.0.0.1 \
     bash --norc --noprofile -c \
-    'count=0; until which rsync >/dev/null 2>&1; do if [ "$count" -ge '"$MAX_WAIT_COUNT"' ]; then echo "Error when trying to rsync files to kubernetes cluster. Package installation may have failed." >&2; exit 1; fi; sleep 0.5; count=$((count+1)); done; exec "$@"' \
+    'count=0; until command -v rsync >/dev/null 2>&1; do if [ "$count" -ge '"$MAX_WAIT_COUNT"' ]; then echo "Error when trying to rsync files to kubernetes cluster. Package installation may have failed." >&2; exit 1; fi; sleep 0.5; count=$((count+1)); done; exec "$@"' \
     -- "$@"
