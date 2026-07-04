@@ -1706,8 +1706,7 @@ class KubernetesCommandRunner(CommandRunner):
                                           **kwargs)
         except subprocess.TimeoutExpired:
             if require_outputs:
-                stderr = (
-                    f'kubectl exec timed out after {timeout} seconds')
+                stderr = (f'kubectl exec timed out after {timeout} seconds')
                 return 124, '', stderr
             raise
         # When `kubectl exec` fails because the target pod is already gone
