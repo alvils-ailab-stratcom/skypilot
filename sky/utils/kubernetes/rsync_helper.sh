@@ -11,7 +11,7 @@ if ! command -v nc >/dev/null 2>&1; then
     exit 1
 fi
 url_decode() {
-    echo "$1" | sed 's|%40|@|g' | sed 's|%3A|:|g' | sed 's|%2B|+|g' | sed 's|%2F|/|g'
+    printf '%s\n' "$1" | sed 's|%40|@|g' | sed 's|%3A|:|g' | sed 's|%2B|+|g' | sed 's|%2F|/|g'
 }
 
 if [ "$1" = "-l" ]; then
