@@ -6,6 +6,10 @@
 
 set -u
 
+if ! command -v nc >/dev/null 2>&1; then
+    echo "Error: netcat (nc) is required but not installed." >&2
+    exit 1
+fi
 url_decode() {
     echo "$1" | sed 's|%40|@|g' | sed 's|%3A|:|g' | sed 's|%2B|+|g' | sed 's|%2F|/|g'
 }
