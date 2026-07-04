@@ -68,8 +68,6 @@ RSYNC_NO_OWNER_NO_GROUP_OPTION = '--no-owner --no-group'
 
 _HASH_MAX_LENGTH = 10
 _DEFAULT_CONNECT_TIMEOUT = 30
-_K8S_CAPTURED_EXEC_TIMEOUT = int(
-    os.environ.get('SKYPILOT_K8S_CAPTURED_EXEC_TIMEOUT', '20'))
 
 DEFAULT_SSH_CONTROL_NAME = '__default__'
 
@@ -1690,25 +1688,14 @@ class KubernetesCommandRunner(CommandRunner):
             # immediately at EOF, making it impossible to detect
             # disconnection.
             kwargs.setdefault('stdin', subprocess.PIPE)
-        timeout = kwargs.pop('timeout', None)
-        if timeout is None and require_outputs and not stream_logs:
-            timeout = _K8S_CAPTURED_EXEC_TIMEOUT
-
-        try:
-            result = log_lib.run_with_log(' '.join(command),
-                                          log_path,
-                                          require_outputs=require_outputs,
-                                          stream_logs=stream_logs,
-                                          process_stream=process_stream,
-                                          shell=True,
-                                          executable=executable,
-                                          timeout=timeout,
-                                          **kwargs)
-        except subprocess.TimeoutExpired:
-            if require_outputs:
-                stderr = (f'kubectl exec timed out after {timeout} seconds')
-                return 124, '', stderr
-            raise
+        result = log_lib.run_with_log(' '.join(command),
+                                      log_path,
+                                      require_outputs=require_outputs,
+                                      stream_logs=stream_logs,
+                                      process_stream=process_stream,
+                                      shell=True,
+                                      executable=executable,
+                                      **kwargs)
         # When `kubectl exec` fails because the target pod is already gone
         # (e.g. it was OOMKilled), the bare kubectl error ("cannot exec into a
         # container in a completed pod") hides the real cause. Enrich stderr
