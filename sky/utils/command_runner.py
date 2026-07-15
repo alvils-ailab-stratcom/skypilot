@@ -1694,9 +1694,11 @@ class KubernetesCommandRunner(CommandRunner):
         # provisioning forever. Guard only stream_logs=False execs (ray-status
         # probe, start_ray) — long, legitimately-slow streaming setup steps
         # stay unbounded. On timeout return a retryable rc=124 so callers'
-        # wait loops re-run; the hang is intermittent.
+        # wait loops re-run; the hang is intermittent. Tunable via
+        # SKYPILOT_K8S_EXEC_TIMEOUT (seconds) on the API server / controller.
         if not stream_logs and 'timeout' not in kwargs:
-            kwargs['timeout'] = 600
+            kwargs['timeout'] = int(
+                os.environ.get('SKYPILOT_K8S_EXEC_TIMEOUT', '120'))
         try:
             result = log_lib.run_with_log(' '.join(command),
                                           log_path,
