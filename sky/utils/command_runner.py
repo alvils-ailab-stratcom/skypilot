@@ -1688,14 +1688,30 @@ class KubernetesCommandRunner(CommandRunner):
             # immediately at EOF, making it impossible to detect
             # disconnection.
             kwargs.setdefault('stdin', subprocess.PIPE)
-        result = log_lib.run_with_log(' '.join(command),
-                                      log_path,
-                                      require_outputs=require_outputs,
-                                      stream_logs=stream_logs,
-                                      process_stream=process_stream,
-                                      shell=True,
-                                      executable=executable,
-                                      **kwargs)
+        # PATCH(stratcom): bound non-streaming control-plane execs. Some
+        # kubelets (kernel 7.0: athena/tsdb1) leave the exec stream open after
+        # the remote command finishes, so an un-timeout-guarded run() blocks
+        # provisioning forever. Guard only stream_logs=False execs (ray-status
+        # probe, start_ray) — long, legitimately-slow streaming setup steps
+        # stay unbounded. On timeout return a retryable rc=124 so callers'
+        # wait loops re-run; the hang is intermittent.
+        if not stream_logs and 'timeout' not in kwargs:
+            kwargs['timeout'] = 600
+        try:
+            result = log_lib.run_with_log(' '.join(command),
+                                          log_path,
+                                          require_outputs=require_outputs,
+                                          stream_logs=stream_logs,
+                                          process_stream=process_stream,
+                                          shell=True,
+                                          executable=executable,
+                                          **kwargs)
+        except subprocess.TimeoutExpired:
+            # Retryable failure — return early and skip the kubectl-based
+            # dead-pod enrichment below, which could hang the same way.
+            if require_outputs:
+                return 124, '', 'kubectl exec timed out (hung stream)'
+            return 124
         # When `kubectl exec` fails because the target pod is already gone
         # (e.g. it was OOMKilled), the bare kubectl error ("cannot exec into a
         # container in a completed pod") hides the real cause. Enrich stderr

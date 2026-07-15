@@ -137,18 +137,29 @@ _RAY_PORT_COMMAND = (
     'print(message_utils.encode_payload({\'ray_port\': $RAY_PORT}))"')
 
 # Command that calls `ray status` with SkyPilot's Ray port set.
+# PATCH(stratcom): bound with `timeout 15` — a `ray status` racing GCS startup
+# can connect to a half-initialized GCS and block forever (observed live
+# 2026-07-15 on the serve controller: the wait loop's status call at T+5s of
+# GCS start never returned). rc=124 reads as "not healthy yet"; callers retry.
 RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
     f'{_RAY_PORT_COMMAND}; '
-    f'RAY_ADDRESS=127.0.0.1:$RAY_PORT {constants.SKY_RAY_CMD} status')
+    f'RAY_ADDRESS=127.0.0.1:$RAY_PORT timeout 15 {constants.SKY_RAY_CMD} status')
 
 # Command that waits for the ray status to be initialized. Otherwise, a later
 # `sky status -r` may fail due to the ray cluster not being ready.
 # Reads SKYPILOT_RAY_PORT (exported by the hostNetwork probe) rather than
 # the constants.RAY_STATUS literal — the probe picks a dynamic port.
+# PATCH(stratcom): restructured so the loop exits ONLY on a healthy
+# `ray status` (rc 0 and not "No cluster status."). Each probe is bounded by
+# `timeout 15`; a timed-out/failed probe RETRIES instead of (a) hanging the
+# loop forever on a stuck invocation or (b) exiting early on empty output.
 RAY_HEAD_WAIT_INITIALIZED_COMMAND = (
-    'while `RAY_ADDRESS=127.0.0.1:${SKYPILOT_RAY_PORT:-'
+    'while true; do '
+    'ray_status_output=$(RAY_ADDRESS=127.0.0.1:${SKYPILOT_RAY_PORT:-'
     f'{constants.SKY_REMOTE_RAY_PORT}}} '
-    f'{constants.SKY_RAY_CMD} status | grep -q "No cluster status."`; do '
+    f'timeout 15 {constants.SKY_RAY_CMD} status 2>&1) '
+    '&& ! echo "$ray_status_output" | grep -q "No cluster status." '
+    '&& break; '
     'sleep 0.5; '
     'echo "Waiting ray cluster to be initialized"; '
     'done;')
