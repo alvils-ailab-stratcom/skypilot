@@ -57,21 +57,26 @@ else
     echo "Assuming resource is a pod: $resource_name" >&2
 fi
 
-sky_key="${SKYPILOT_SSH_KEY:-}"
-if [ -z "$sky_key" ]; then
+# Candidate private keys. A multi-client API server keeps one keypair per
+# user hash under ~/.sky/clients/<hash>/ssh/, and a pod's authorized_keys
+# holds only the LAUNCHING user's pubkey — taking the first glob match
+# (upstream #10033 behavior) offers the wrong client's key whenever more
+# than one exists, denying auth for every user. Collect ALL keys and probe;
+# SKYPILOT_SSH_KEY pins a single key explicitly.
+sky_keys=()
+if [ -n "${SKYPILOT_SSH_KEY:-}" ] && [ -f "${SKYPILOT_SSH_KEY}" ]; then
+    sky_keys=("${SKYPILOT_SSH_KEY}")
+else
     for candidate in "${HOME:-}"/.sky/clients/*/ssh/sky-key; do
-        if [ -f "$candidate" ]; then
-            sky_key="$candidate"
-            break
-        fi
+        [ -f "$candidate" ] && sky_keys+=("$candidate")
     done
 fi
-if [ -z "$sky_key" ] || [ ! -f "$sky_key" ]; then
-    log "Could not find SkyPilot SSH key. Set SKYPILOT_SSH_KEY to the pod SSH private key."
+if [ "${#sky_keys[@]}" -eq 0 ]; then
+    log "Could not find any SkyPilot SSH key. Set SKYPILOT_SSH_KEY to the pod SSH private key."
     exit 1
 fi
-chmod 600 "$sky_key" 2>/dev/null || true
-echo "ssh_key: $sky_key" >&2
+chmod 600 "${sky_keys[@]}" 2>/dev/null || true
+log "candidate ssh keys: ${sky_keys[*]}"
 
 pick_port() {
     base=$((20000 + ($$ % 20000)))
@@ -132,7 +137,6 @@ log "port-forward ready after $((count / 2))s"
 
 ssh_opts=(
     -p "$local_port"
-    -i "$sky_key"
     -o StrictHostKeyChecking=no
     -o UserKnownHostsFile=/dev/null
     -o IdentitiesOnly=yes
@@ -146,39 +150,65 @@ ssh_opts=(
     -o ServerAliveCountMax=4
 )
 
-# The pod's startup script writes the client public key into the CONTAINER
-# DEFAULT USER's ~/.ssh/authorized_keys (and enables root login). SkyPilot's
-# own images default to user `sky`, but custom images (e.g. vllm/vllm-openai)
-# default to root and have no `sky` user at all — so probe candidates and use
-# the first that authenticates. SKYPILOT_SSH_USER skips the probe entirely.
-ssh_user="${SKYPILOT_SSH_USER:-}"
-if [ -n "$ssh_user" ]; then
-    log "ssh user: ${ssh_user} (from SKYPILOT_SSH_USER, probe skipped)"
+# The pod's startup script writes the LAUNCHING client's public key into the
+# CONTAINER DEFAULT USER's ~/.ssh/authorized_keys (and enables root login).
+# SkyPilot's own images default to user `sky`; custom images (e.g.
+# vllm/vllm-openai) default to root with no `sky` user. Probe every
+# (key, user) combination and use the first that authenticates; cache the
+# working pair per pod so later invocations skip the scan.
+# SKYPILOT_SSH_USER pins the user (still probed against each key).
+ssh_user=""
+sky_key=""
+if [ -n "${SKYPILOT_SSH_USER:-}" ]; then
+    users=("${SKYPILOT_SSH_USER}")
 else
-    for candidate_user in sky root; do
-        probe_out=$(ssh "${ssh_opts[@]}" -o BatchMode=yes \
-            "${candidate_user}@127.0.0.1" true 2>&1)
-        probe_rc=$?
-        if [ "$probe_rc" -eq 0 ]; then
-            ssh_user=$candidate_user
-            log "ssh user probe: ${candidate_user}@ OK -> using ${ssh_user}"
-            break
+    users=(sky root)
+fi
+auth_cache="${TMPDIR:-/tmp}/skypilot-rsync-auth-${resource_name}"
+if [ -f "$auth_cache" ]; then
+    IFS=$'\t' read -r cached_key cached_user < "$auth_cache" || true
+    if [ -n "${cached_key:-}" ] && [ -f "$cached_key" ] && [ -n "${cached_user:-}" ]; then
+        if ssh "${ssh_opts[@]}" -i "$cached_key" -o BatchMode=yes \
+                "${cached_user}@127.0.0.1" true >/dev/null 2>&1; then
+            sky_key=$cached_key
+            ssh_user=$cached_user
+            log "auth cache hit: ${ssh_user}@ with ${sky_key}"
+        else
+            log "auth cache stale, rescanning"
+            rm -f "$auth_cache" 2>/dev/null || true
         fi
-        log "ssh user probe: ${candidate_user}@ failed (rc=${probe_rc}): ${probe_out}"
+    fi
+fi
+if [ -z "$ssh_user" ]; then
+    for candidate_key in "${sky_keys[@]}"; do
+        for candidate_user in "${users[@]}"; do
+            probe_out=$(ssh "${ssh_opts[@]}" -i "$candidate_key" -o BatchMode=yes \
+                "${candidate_user}@127.0.0.1" true 2>&1)
+            probe_rc=$?
+            if [ "$probe_rc" -eq 0 ]; then
+                sky_key=$candidate_key
+                ssh_user=$candidate_user
+                printf '%s\t%s\n' "$sky_key" "$ssh_user" > "$auth_cache" 2>/dev/null || true
+                log "auth probe: ${candidate_user}@ with ${candidate_key} OK"
+                break 2
+            fi
+            log "auth probe: ${candidate_user}@ with ${candidate_key} failed (rc=${probe_rc}): ${probe_out}"
+        done
     done
     if [ -z "$ssh_user" ]; then
-        log "FAIL(ssh-auth): no candidate user (sky, root) authenticated with key ${sky_key}."
-        log "Hints: image default user must have the key in ~/.ssh/authorized_keys (written by the pod startup script); set SKYPILOT_SSH_USER to override. port-forward log:"
+        log "FAIL(ssh-auth): no (key, user) combination authenticated. keys: ${sky_keys[*]}; users: ${users[*]}"
+        log "Hints: the pod's authorized_keys holds only the launching user's pubkey; set SKYPILOT_SSH_KEY / SKYPILOT_SSH_USER to pin. port-forward log:"
         cat "$pf_log" >&2 2>/dev/null || true
         exit 255
     fi
 fi
+echo "ssh_key: $sky_key" >&2
 
 MAX_WAIT_TIME_SECONDS=300
 MAX_WAIT_COUNT=$((MAX_WAIT_TIME_SECONDS * 2))
 
-log "exec rsync transport: ssh ${ssh_user}@127.0.0.1:${local_port}, remote command: $*"
-exec ssh "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" \
+log "exec rsync transport: ssh ${ssh_user}@127.0.0.1:${local_port} (key: ${sky_key}), remote command: $*"
+exec ssh "${ssh_opts[@]}" -i "$sky_key" "${ssh_user}@127.0.0.1" \
     bash --norc --noprofile -c \
     'count=0; until command -v rsync >/dev/null 2>&1; do if [ "$count" -ge '"$MAX_WAIT_COUNT"' ]; then echo "Error when trying to rsync files to kubernetes cluster. Package installation may have failed." >&2; exit 1; fi; sleep 0.5; count=$((count+1)); done; exec "$@"' \
     -- "$@"
