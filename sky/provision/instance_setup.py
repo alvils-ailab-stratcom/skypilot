@@ -725,12 +725,17 @@ def _internal_file_mounts(file_mounts: Dict,
                             f'{src} -> {dst}.'),
             stderr=stdout + stderr)
 
+        # PATCH(stratcom): generous retries — with the io-inactivity bound in
+        # _rsync (SKYPILOT_RSYNC_IO_TIMEOUT) a wedged kubelet stream now costs
+        # ~120s per attempt instead of hanging forever, so retrying here is
+        # what makes provisioning through a flaky streaming path self-healing.
         runner.rsync_setup(
             source=src,
             target=dst,
             up=True,
             log_path=log_path,
             stream_logs=False,
+            max_retry=5,
         )
 
 
