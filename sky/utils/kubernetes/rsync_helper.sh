@@ -179,7 +179,9 @@ if [ -f "$auth_cache" ]; then
         fi
     fi
 fi
-if [ -z "$ssh_user" ]; then
+scan_auth() {
+    # $1 = 1 to log per-combo failures (first/last round only, to avoid spam)
+    local log_failures=$1 candidate_key candidate_user probe_out probe_rc
     for candidate_key in "${sky_keys[@]}"; do
         for candidate_user in "${users[@]}"; do
             probe_out=$(ssh "${ssh_opts[@]}" -i "$candidate_key" -o BatchMode=yes \
@@ -188,19 +190,46 @@ if [ -z "$ssh_user" ]; then
             if [ "$probe_rc" -eq 0 ]; then
                 sky_key=$candidate_key
                 ssh_user=$candidate_user
-                printf '%s\t%s\n' "$sky_key" "$ssh_user" > "$auth_cache" 2>/dev/null || true
-                log "auth probe: ${candidate_user}@ with ${candidate_key} OK"
-                break 2
+                return 0
             fi
-            log "auth probe: ${candidate_user}@ with ${candidate_key} failed (rc=${probe_rc}): ${probe_out}"
+            [ "$log_failures" = "1" ] && \
+                log "auth probe: ${candidate_user}@ with ${candidate_key} failed (rc=${probe_rc}): ${probe_out}"
         done
     done
-    if [ -z "$ssh_user" ]; then
-        log "FAIL(ssh-auth): no (key, user) combination authenticated. keys: ${sky_keys[*]}; users: ${users[*]}"
-        log "Hints: the pod's authorized_keys holds only the launching user's pubkey; set SKYPILOT_SSH_KEY / SKYPILOT_SSH_USER to pin. port-forward log:"
-        cat "$pf_log" >&2 2>/dev/null || true
-        exit 255
-    fi
+    return 1
+}
+
+if [ -z "$ssh_user" ]; then
+    # A freshly started pod may not have written authorized_keys yet — its
+    # startup script (apt + ssh setup) can take minutes on slow mirrors, and
+    # until then every probe gets 'Permission denied'. That is transient, so
+    # keep scanning for up to SKYPILOT_SSH_AUTH_WAIT seconds (default 180,
+    # 0 = single scan) before treating auth as genuinely broken.
+    auth_wait="${SKYPILOT_SSH_AUTH_WAIT:-180}"
+    auth_start=$SECONDS
+    round=0
+    while :; do
+        if scan_auth "$([ "$round" -eq 0 ] && echo 1 || echo 0)"; then
+            printf '%s\t%s\n' "$sky_key" "$ssh_user" > "$auth_cache" 2>/dev/null || true
+            log "auth probe: ${ssh_user}@ with ${sky_key} OK (after $((SECONDS - auth_start))s)"
+            break
+        fi
+        elapsed=$((SECONDS - auth_start))
+        if [ "$elapsed" -ge "$auth_wait" ]; then
+            scan_auth 1 || true   # final round with full failure logging
+            if [ -z "$ssh_user" ]; then
+                log "FAIL(ssh-auth): no (key, user) combination authenticated after ${elapsed}s. keys: ${sky_keys[*]}; users: ${users[*]}"
+                log "Hints: pod ssh setup may have failed, or set SKYPILOT_SSH_KEY / SKYPILOT_SSH_USER to pin. port-forward log:"
+                cat "$pf_log" >&2 2>/dev/null || true
+                exit 255
+            fi
+            printf '%s\t%s\n' "$sky_key" "$ssh_user" > "$auth_cache" 2>/dev/null || true
+            break
+        fi
+        round=$((round + 1))
+        log "auth not ready (${elapsed}s/${auth_wait}s) — pod ssh setup likely still running; retrying in 5s"
+        sleep 5
+    done
 fi
 echo "ssh_key: $sky_key" >&2
 
