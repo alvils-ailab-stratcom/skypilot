@@ -6,8 +6,12 @@
 
 set -u
 
+log() {
+    echo "[rsync_helper $(date -u +%H:%M:%S)] $*" >&2
+}
+
 if ! command -v nc >/dev/null 2>&1; then
-    echo "Error: netcat (nc) is required but not installed." >&2
+    log "Error: netcat (nc) is required but not installed."
     exit 1
 fi
 url_decode() {
@@ -63,7 +67,7 @@ if [ -z "$sky_key" ]; then
     done
 fi
 if [ -z "$sky_key" ] || [ ! -f "$sky_key" ]; then
-    echo "Could not find SkyPilot SSH key. Set SKYPILOT_SSH_KEY to the pod SSH private key." >&2
+    log "Could not find SkyPilot SSH key. Set SKYPILOT_SSH_KEY to the pod SSH private key."
     exit 1
 fi
 chmod 600 "$sky_key" 2>/dev/null || true
@@ -106,23 +110,25 @@ else
     kubectl port-forward "$resource_type/$resource_name" -n "$namespace" --context="$context" --address 127.0.0.1 "${local_port}:22" >"$pf_log" 2>&1 &
 fi
 pf_pid=$!
+log "port-forward started: pid ${pf_pid}, ${resource_type}/${resource_name} 127.0.0.1:${local_port} -> 22 (context: ${context:-<in-cluster>})"
 
 count=0
 max_count=600
 until nc -z 127.0.0.1 "$local_port" >/dev/null 2>&1; do
     if ! kill -0 "$pf_pid" >/dev/null 2>&1; then
-        echo "kubectl port-forward exited before port ${local_port} became ready." >&2
+        log "FAIL(port-forward): kubectl port-forward exited before port ${local_port} became ready. Log:"
         cat "$pf_log" >&2 2>/dev/null || true
         exit 1
     fi
     if [ "$count" -ge "$max_count" ]; then
-        echo "Timed out waiting for kubectl port-forward to pod SSH port 22." >&2
+        log "FAIL(port-forward): timed out waiting for kubectl port-forward to pod SSH port 22. Log:"
         cat "$pf_log" >&2 2>/dev/null || true
         exit 1
     fi
     sleep 0.5
     count=$((count + 1))
 done
+log "port-forward ready after $((count / 2))s"
 
 ssh_opts=(
     -p "$local_port"
@@ -134,10 +140,39 @@ ssh_opts=(
     -o ConnectTimeout=5
 )
 
+# The pod's startup script writes the client public key into the CONTAINER
+# DEFAULT USER's ~/.ssh/authorized_keys (and enables root login). SkyPilot's
+# own images default to user `sky`, but custom images (e.g. vllm/vllm-openai)
+# default to root and have no `sky` user at all — so probe candidates and use
+# the first that authenticates. SKYPILOT_SSH_USER skips the probe entirely.
+ssh_user="${SKYPILOT_SSH_USER:-}"
+if [ -n "$ssh_user" ]; then
+    log "ssh user: ${ssh_user} (from SKYPILOT_SSH_USER, probe skipped)"
+else
+    for candidate_user in sky root; do
+        probe_out=$(ssh "${ssh_opts[@]}" -o BatchMode=yes \
+            "${candidate_user}@127.0.0.1" true 2>&1)
+        probe_rc=$?
+        if [ "$probe_rc" -eq 0 ]; then
+            ssh_user=$candidate_user
+            log "ssh user probe: ${candidate_user}@ OK -> using ${ssh_user}"
+            break
+        fi
+        log "ssh user probe: ${candidate_user}@ failed (rc=${probe_rc}): ${probe_out}"
+    done
+    if [ -z "$ssh_user" ]; then
+        log "FAIL(ssh-auth): no candidate user (sky, root) authenticated with key ${sky_key}."
+        log "Hints: image default user must have the key in ~/.ssh/authorized_keys (written by the pod startup script); set SKYPILOT_SSH_USER to override. port-forward log:"
+        cat "$pf_log" >&2 2>/dev/null || true
+        exit 255
+    fi
+fi
+
 MAX_WAIT_TIME_SECONDS=300
 MAX_WAIT_COUNT=$((MAX_WAIT_TIME_SECONDS * 2))
 
-exec ssh "${ssh_opts[@]}" sky@127.0.0.1 \
+log "exec rsync transport: ssh ${ssh_user}@127.0.0.1:${local_port}, remote command: $*"
+exec ssh "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" \
     bash --norc --noprofile -c \
     'count=0; until command -v rsync >/dev/null 2>&1; do if [ "$count" -ge '"$MAX_WAIT_COUNT"' ]; then echo "Error when trying to rsync files to kubernetes cluster. Package installation may have failed." >&2; exit 1; fi; sleep 0.5; count=$((count+1)); done; exec "$@"' \
     -- "$@"
