@@ -138,6 +138,12 @@ ssh_opts=(
     -o IdentitiesOnly=yes
     -o LogLevel=ERROR
     -o ConnectTimeout=5
+    # A kubelet with the kernel-7.0 stream bug can wedge the port-forward
+    # data stream mid-transfer (0 bytes, forever) with no error to either
+    # side. Keepalives make ssh detect the dead stream in ~60s and exit
+    # nonzero, so the caller's rsync retry re-rolls instead of hanging.
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=4
 )
 
 # The pod's startup script writes the client public key into the CONTAINER
