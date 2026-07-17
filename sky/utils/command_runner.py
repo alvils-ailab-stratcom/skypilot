@@ -1663,6 +1663,17 @@ class KubernetesCommandRunner(CommandRunner):
             skip_num_lines=skip_num_lines,
             source_bashrc=source_bashrc,
             run_in_background=run_in_background)
+        # PATCH(stratcom): heartbeat for the idle-timeout watchdog (see the
+        # timeout block below and log_lib.run_with_log). A backgrounded loop
+        # emits a bare CR to stderr every 20s so a working-but-silent guarded
+        # exec keeps the log advancing and is not mistaken for a wedged stream;
+        # torn down with the command. Only for guarded (non-streaming) execs.
+        if not stream_logs and not run_in_background:
+            command_str = (
+                '__skyhb(){ while :; do sleep 20; printf "\\r" >&2; done; };'
+                ' __skyhb & __skyhbpid=$!;'
+                ' trap "kill $__skyhbpid 2>/dev/null" EXIT INT TERM; '
+            ) + command_str
         command = kubectl_base_command + [
             # It is important to use /bin/bash -c here to make sure we quote the
             # command to be run properly. Otherwise, directly appending commands
@@ -1702,13 +1713,24 @@ class KubernetesCommandRunner(CommandRunner):
         # kubelets (kernel 7.0: athena/tsdb1) leave the exec stream open after
         # the remote command finishes, so an un-timeout-guarded run() blocks
         # provisioning forever. Guard only stream_logs=False execs (ray-status
-        # probe, start_ray) — long, legitimately-slow streaming setup steps
-        # stay unbounded. On timeout return a retryable rc=124 so callers'
-        # wait loops re-run; the hang is intermittent. Tunable via
-        # SKYPILOT_K8S_EXEC_TIMEOUT (seconds) on the API server / controller.
+        # probe, start_ray, COPY-mode file mounts) — streaming setup steps stay
+        # unbounded. On timeout return a retryable rc=124 so callers' wait
+        # loops re-run; the hang is intermittent.
+        #
+        # Two bounds work together (see log_lib.run_with_log):
+        #   SKYPILOT_K8S_EXEC_IDLE_TIMEOUT (default 120s) — the PRIMARY bound:
+        #     kill only after this long with NO output activity on the log.
+        #     Distinguishes a genuinely wedged stream (silent -> reaped fast)
+        #     from a legitimately-slow-but-productive command like a COPY-mode
+        #     hf:// snapshot_download of tens of GB (its progress output keeps
+        #     the stream alive, so it is never mistaken for a hang).
+        #   SKYPILOT_K8S_EXEC_TIMEOUT (default 3600s) — absolute wall-clock
+        #     backstop for a runaway that somehow keeps chattering.
         if not stream_logs and 'timeout' not in kwargs:
             kwargs['timeout'] = int(
-                os.environ.get('SKYPILOT_K8S_EXEC_TIMEOUT', '120'))
+                os.environ.get('SKYPILOT_K8S_EXEC_TIMEOUT', '3600'))
+            kwargs['idle_timeout'] = int(
+                os.environ.get('SKYPILOT_K8S_EXEC_IDLE_TIMEOUT', '120'))
         try:
             result = log_lib.run_with_log(' '.join(command),
                                           log_path,
