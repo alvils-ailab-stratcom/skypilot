@@ -311,8 +311,15 @@ def run_with_log(
             # so a working-but-quiet command keeps the log advancing; a dead
             # stream delivers neither output nor heartbeats and is reaped fast.
             # Runs alongside `timeout`, which stays as an absolute backstop.
+            # NOTE(stratcom): everything below must stay INSIDE the
+            # `idle_timeout is not None` guard and use a local import. This
+            # function is inlined verbatim into the generated remote job script
+            # (~/.sky/sky_app/sky_job_*), which does not import threading — an
+            # unconditional threading.Event() here crashes every job driver
+            # with NameError (2026-07-17). The pre-existing wall-clock timer is
+            # safe only because it is likewise constructed under its own guard.
             idle_triggered = False
-            idle_stop = threading.Event()
+            idle_stop = None
             idle_watchdog = None
 
             def _idle_watchdog():
@@ -335,8 +342,10 @@ def run_with_log(
 
             if (idle_timeout is not None and log_path and
                     log_path != os.devnull):
-                idle_watchdog = threading.Thread(target=_idle_watchdog,
-                                                 daemon=True)
+                import threading as _threading  # pylint: disable=import-outside-toplevel
+                idle_stop = _threading.Event()
+                idle_watchdog = _threading.Thread(target=_idle_watchdog,
+                                                  daemon=True)
                 idle_watchdog.start()
 
             try:
