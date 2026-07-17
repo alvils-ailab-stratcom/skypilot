@@ -168,7 +168,7 @@ auth_cache="${TMPDIR:-/tmp}/skypilot-rsync-auth-${resource_name}"
 if [ -f "$auth_cache" ]; then
     IFS=$'\t' read -r cached_key cached_user < "$auth_cache" || true
     if [ -n "${cached_key:-}" ] && [ -f "$cached_key" ] && [ -n "${cached_user:-}" ]; then
-        if ssh "${ssh_opts[@]}" -i "$cached_key" -o BatchMode=yes \
+        if ssh -n "${ssh_opts[@]}" -i "$cached_key" -o BatchMode=yes \
                 "${cached_user}@127.0.0.1" true >/dev/null 2>&1; then
             sky_key=$cached_key
             ssh_user=$cached_user
@@ -184,7 +184,12 @@ scan_auth() {
     local log_failures=$1 candidate_key candidate_user probe_out probe_rc
     for candidate_key in "${sky_keys[@]}"; do
         for candidate_user in "${users[@]}"; do
-            probe_out=$(ssh "${ssh_opts[@]}" -i "$candidate_key" -o BatchMode=yes \
+            # -n: stdin from /dev/null. The helper runs INSIDE rsync's transport
+            # process, so an un-redirected probe session inherits rsync's stdin
+            # pipe and eats the 4-byte protocol greeting — deadlocking both
+            # rsync ends while ssh keepalives keep the tunnel looking healthy
+            # (root cause of the 2026-07-16 zero-byte wedge epidemic).
+            probe_out=$(ssh -n "${ssh_opts[@]}" -i "$candidate_key" -o BatchMode=yes \
                 "${candidate_user}@127.0.0.1" true 2>&1)
             probe_rc=$?
             if [ "$probe_rc" -eq 0 ]; then
