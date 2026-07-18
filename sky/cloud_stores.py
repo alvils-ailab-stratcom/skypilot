@@ -943,6 +943,35 @@ if not token:
             ])
             return self._python_command(code)
 
+        # PATCH(stratcom): snapshot_download is SILENT through a non-tty
+        # kubectl exec, so the k8s idle-activity exec bound (which guards these
+        # pre-rsync commands) kills any download slower than the idle window as
+        # "stream idle" (rc=124) — a 15 GB COPY died twice at exactly 300s live
+        # 2026-07-18. Emit REAL progress: a daemon thread prints the byte count
+        # materialized on disk, but ONLY when it changed — a genuinely wedged
+        # download goes quiet and still gets reaped; a slow-but-moving one stays
+        # alive. (Never fabricate activity — see the g-build heartbeat lesson.)
+        progress_helper = '\n'.join([
+            'import threading, time',
+            'def _sky_du(path):',
+            '    total = 0',
+            '    for _r, _d, _files in os.walk(path):',
+            '        for _f in _files:',
+            '            try:',
+            '                total += os.path.getsize(os.path.join(_r, _f))',
+            '            except OSError:',
+            '                pass',
+            '    return total',
+            'def _sky_progress(path, interval=60):',
+            '    last = -1',
+            '    while True:',
+            '        time.sleep(interval)',
+            '        cur = _sky_du(path)',
+            '        if cur != last:',
+            '            print("[hf-sync] %d bytes materialized" % cur,',
+            '                  flush=True)',
+            '            last = cur',
+        ])
         repo_type, repo_id, revision, sub_path = data_utils.split_hf_repo_path(
             source)
         if sub_path:
@@ -961,6 +990,9 @@ if not token:
                 f'dest = os.path.expanduser({destination!r})',
                 'os.makedirs(dest, exist_ok=True)',
                 'tmp_dir = tempfile.mkdtemp()',
+                progress_helper,
+                ('threading.Thread(target=_sky_progress, args=(tmp_dir,), '
+                 'daemon=True).start()'),
                 'try:',
                 (f'    snapshot_download(repo_id={repo_id!r}, '
                  f'repo_type={repo_type!r}, revision={revision!r}, '
@@ -981,6 +1013,10 @@ if not token:
                 'from huggingface_hub import snapshot_download',
                 self._TOKEN_HELPER,
                 f'dest = os.path.expanduser({destination!r})',
+                'os.makedirs(dest, exist_ok=True)',
+                progress_helper,
+                ('threading.Thread(target=_sky_progress, args=(dest,), '
+                 'daemon=True).start()'),
                 (f'snapshot_download(repo_id={repo_id!r}, '
                  f'repo_type={repo_type!r}, revision={revision!r}, '
                  f'local_dir=dest, allow_patterns=None, '
