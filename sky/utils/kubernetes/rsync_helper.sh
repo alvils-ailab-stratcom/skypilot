@@ -1,69 +1,248 @@
 #!/bin/bash
-# We need to determine the pod, namespace and context from the args
-# For backward compatibility, we use + as the separator between namespace and context and add handling when context is not provided
+# SkyPilot rsync remote shell for Kubernetes pods.
+#
+# This local patch avoids a kubectl exec -i EOF deadlock seen with SSH node
+# pools by forwarding pod port 22 and running rsync over real SSH.
+
+set -u
+
+log() {
+    echo "[rsync_helper $(date -u +%H:%M:%S)] $*" >&2
+}
+
+if ! command -v nc >/dev/null 2>&1; then
+    log "Error: netcat (nc) is required but not installed."
+    exit 1
+fi
+url_decode() {
+    printf '%s\n' "$1" | sed 's|%40|@|g' | sed 's|%3A|:|g' | sed 's|%2B|+|g' | sed 's|%2F|/|g'
+}
+
 if [ "$1" = "-l" ]; then
-    # -l pod namespace+context ...
-    # used by normal rsync
     shift
     pod=$1
     shift
     encoded_namespace_context=$1
-    shift # Shift past the encoded namespace+context
+    shift
     echo "pod: $pod" >&2
-    # Revert the encoded namespace+context to the original string.
-    namespace_context=$(echo "$encoded_namespace_context" | sed 's|%40|@|g' | sed 's|%3A|:|g' | sed 's|%2B|+|g' | sed 's|%2F|/|g')
+    namespace_context=$(url_decode "$encoded_namespace_context")
     echo "namespace_context: $namespace_context" >&2
 else
-    # pod@namespace+context ...
-    # used by openrsync
     encoded_pod_namespace_context=$1
-    shift # Shift past the pod@namespace+context
-    pod_namespace_context=$(echo "$encoded_pod_namespace_context" | sed 's|%40|@|g' | sed 's|%3A|:|g' | sed 's|%2B|+|g' | sed 's|%2F|/|g')
+    shift
+    pod_namespace_context=$(url_decode "$encoded_pod_namespace_context")
     echo "pod_namespace_context: $pod_namespace_context" >&2
-    pod=$(echo $pod_namespace_context | cut -d@ -f1)
+    pod=$(echo "$pod_namespace_context" | cut -d@ -f1)
     echo "pod: $pod" >&2
-    namespace_context=$(echo $pod_namespace_context | cut -d@ -f2-)
+    namespace_context=$(echo "$pod_namespace_context" | cut -d@ -f2-)
     echo "namespace_context: $namespace_context" >&2
 fi
 
-namespace=$(echo $namespace_context | cut -d+ -f1)
+namespace=$(echo "$namespace_context" | cut -d+ -f1)
 echo "namespace: $namespace" >&2
-context=$(echo $namespace_context | grep '+' >/dev/null && echo $namespace_context | cut -d+ -f2- || echo "")
+context=$(echo "$namespace_context" | grep '+' >/dev/null && echo "$namespace_context" | cut -d+ -f2- || echo "")
 echo "context: $context" >&2
 context_lower=$(echo "$context" | tr '[:upper:]' '[:lower:]')
 container="${SKYPILOT_K8S_EXEC_CONTAINER:-ray-node}"
 echo "container: $container" >&2
 
-# Check if the resource is a pod or a deployment (or other type)
 if [[ "$pod" == *"/"* ]]; then
-    # Format is resource_type/resource_name
     echo "Resource contains type: $pod" >&2
-    resource_type=$(echo $pod | cut -d/ -f1)
-    resource_name=$(echo $pod | cut -d/ -f2)
+    resource_type=$(echo "$pod" | cut -d/ -f1)
+    resource_name=$(echo "$pod" | cut -d/ -f2)
     echo "Resource type: $resource_type, Resource name: $resource_name" >&2
 else
-    # For backward compatibility or simple pod name, assume it's a pod
     resource_type="pod"
     resource_name=$pod
     echo "Assuming resource is a pod: $resource_name" >&2
 fi
 
-if [ -z "$context" ] || [ "$context_lower" = "none" ]; then
-    # If context is none, it means we are using incluster auth. In this case,
-    # we need to set KUBECONFIG to /dev/null to avoid using kubeconfig file.
-    kubectl_cmd_base="kubectl exec \"$resource_type/$resource_name\" -n \"$namespace\" -c \"$container\" --kubeconfig=/dev/null --"
+# Candidate private keys. A multi-client API server keeps one keypair per
+# user hash under ~/.sky/clients/<hash>/ssh/, and a pod's authorized_keys
+# holds only the LAUNCHING user's pubkey — taking the first glob match
+# (upstream #10033 behavior) offers the wrong client's key whenever more
+# than one exists, denying auth for every user. Collect ALL keys and probe;
+# SKYPILOT_SSH_KEY pins a single key explicitly.
+sky_keys=()
+if [ -n "${SKYPILOT_SSH_KEY:-}" ] && [ -f "${SKYPILOT_SSH_KEY}" ]; then
+    sky_keys=("${SKYPILOT_SSH_KEY}")
 else
-    kubectl_cmd_base="kubectl exec \"$resource_type/$resource_name\" -n \"$namespace\" -c \"$container\" --context=\"$context\" --"
+    for candidate in "${HOME:-}"/.sky/clients/*/ssh/sky-key; do
+        [ -f "$candidate" ] && sky_keys+=("$candidate")
+    done
 fi
+if [ "${#sky_keys[@]}" -eq 0 ]; then
+    log "Could not find any SkyPilot SSH key. Set SKYPILOT_SSH_KEY to the pod SSH private key."
+    exit 1
+fi
+chmod 600 "${sky_keys[@]}" 2>/dev/null || true
+log "candidate ssh keys: ${sky_keys[*]}"
 
-# Execute command on remote pod, waiting for rsync to be available first.
-# The waiting happens on the remote pod, not locally, which is more efficient
-# and reliable than polling from the local machine.
-# We wrap the command in a bash script that waits for rsync, then execs the original command.
-# Timeout after MAX_WAIT_TIME_SECONDS seconds.
+pick_port() {
+    base=$((20000 + ($$ % 20000)))
+    i=0
+    while [ "$i" -lt 200 ]; do
+        port=$((base + i))
+        if ! nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+            echo "$port"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+local_port=$(pick_port) || {
+    echo "Could not find a free local port for kubectl port-forward." >&2
+    exit 1
+}
+
+pf_pid=""
+pf_log="${TMPDIR:-/tmp}/skypilot-rsync-port-forward-${resource_name}-${local_port}.log"
+
+cleanup() {
+    if [ -n "$pf_pid" ]; then
+        kill "$pf_pid" >/dev/null 2>&1 || true
+        wait "$pf_pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$pf_log" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+if [ -z "$context" ] || [ "$context_lower" = "none" ]; then
+    kubectl port-forward "$resource_type/$resource_name" -n "$namespace" --kubeconfig=/dev/null --address 127.0.0.1 "${local_port}:22" >"$pf_log" 2>&1 &
+else
+    kubectl port-forward "$resource_type/$resource_name" -n "$namespace" --context="$context" --address 127.0.0.1 "${local_port}:22" >"$pf_log" 2>&1 &
+fi
+pf_pid=$!
+log "port-forward started: pid ${pf_pid}, ${resource_type}/${resource_name} 127.0.0.1:${local_port} -> 22 (context: ${context:-<in-cluster>})"
+
+count=0
+max_count=600
+until nc -z 127.0.0.1 "$local_port" >/dev/null 2>&1; do
+    if ! kill -0 "$pf_pid" >/dev/null 2>&1; then
+        log "FAIL(port-forward): kubectl port-forward exited before port ${local_port} became ready. Log:"
+        cat "$pf_log" >&2 2>/dev/null || true
+        exit 1
+    fi
+    if [ "$count" -ge "$max_count" ]; then
+        log "FAIL(port-forward): timed out waiting for kubectl port-forward to pod SSH port 22. Log:"
+        cat "$pf_log" >&2 2>/dev/null || true
+        exit 1
+    fi
+    sleep 0.5
+    count=$((count + 1))
+done
+log "port-forward ready after $((count / 2))s"
+
+ssh_opts=(
+    -p "$local_port"
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o IdentitiesOnly=yes
+    -o LogLevel=ERROR
+    -o ConnectTimeout=5
+    # A kubelet with the kernel-7.0 stream bug can wedge the port-forward
+    # data stream mid-transfer (0 bytes, forever) with no error to either
+    # side. Keepalives make ssh detect the dead stream in ~60s and exit
+    # nonzero, so the caller's rsync retry re-rolls instead of hanging.
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=4
+)
+
+# The pod's startup script writes the LAUNCHING client's public key into the
+# CONTAINER DEFAULT USER's ~/.ssh/authorized_keys (and enables root login).
+# SkyPilot's own images default to user `sky`; custom images (e.g.
+# vllm/vllm-openai) default to root with no `sky` user. Probe every
+# (key, user) combination and use the first that authenticates; cache the
+# working pair per pod so later invocations skip the scan.
+# SKYPILOT_SSH_USER pins the user (still probed against each key).
+ssh_user=""
+sky_key=""
+if [ -n "${SKYPILOT_SSH_USER:-}" ]; then
+    users=("${SKYPILOT_SSH_USER}")
+else
+    users=(sky root)
+fi
+auth_cache="${TMPDIR:-/tmp}/skypilot-rsync-auth-${resource_name}"
+if [ -f "$auth_cache" ]; then
+    IFS=$'\t' read -r cached_key cached_user < "$auth_cache" || true
+    if [ -n "${cached_key:-}" ] && [ -f "$cached_key" ] && [ -n "${cached_user:-}" ]; then
+        if ssh -n "${ssh_opts[@]}" -i "$cached_key" -o BatchMode=yes \
+                "${cached_user}@127.0.0.1" true >/dev/null 2>&1; then
+            sky_key=$cached_key
+            ssh_user=$cached_user
+            log "auth cache hit: ${ssh_user}@ with ${sky_key}"
+        else
+            log "auth cache stale, rescanning"
+            rm -f "$auth_cache" 2>/dev/null || true
+        fi
+    fi
+fi
+scan_auth() {
+    # $1 = 1 to log per-combo failures (first/last round only, to avoid spam)
+    local log_failures=$1 candidate_key candidate_user probe_out probe_rc
+    for candidate_key in "${sky_keys[@]}"; do
+        for candidate_user in "${users[@]}"; do
+            # -n: stdin from /dev/null. The helper runs INSIDE rsync's transport
+            # process, so an un-redirected probe session inherits rsync's stdin
+            # pipe and eats the 4-byte protocol greeting — deadlocking both
+            # rsync ends while ssh keepalives keep the tunnel looking healthy
+            # (root cause of the 2026-07-16 zero-byte wedge epidemic).
+            probe_out=$(ssh -n "${ssh_opts[@]}" -i "$candidate_key" -o BatchMode=yes \
+                "${candidate_user}@127.0.0.1" true 2>&1)
+            probe_rc=$?
+            if [ "$probe_rc" -eq 0 ]; then
+                sky_key=$candidate_key
+                ssh_user=$candidate_user
+                return 0
+            fi
+            [ "$log_failures" = "1" ] && \
+                log "auth probe: ${candidate_user}@ with ${candidate_key} failed (rc=${probe_rc}): ${probe_out}"
+        done
+    done
+    return 1
+}
+
+if [ -z "$ssh_user" ]; then
+    # A freshly started pod may not have written authorized_keys yet — its
+    # startup script (apt + ssh setup) can take minutes on slow mirrors, and
+    # until then every probe gets 'Permission denied'. That is transient, so
+    # keep scanning for up to SKYPILOT_SSH_AUTH_WAIT seconds (default 180,
+    # 0 = single scan) before treating auth as genuinely broken.
+    auth_wait="${SKYPILOT_SSH_AUTH_WAIT:-180}"
+    auth_start=$SECONDS
+    round=0
+    while :; do
+        if scan_auth "$([ "$round" -eq 0 ] && echo 1 || echo 0)"; then
+            printf '%s\t%s\n' "$sky_key" "$ssh_user" > "$auth_cache" 2>/dev/null || true
+            log "auth probe: ${ssh_user}@ with ${sky_key} OK (after $((SECONDS - auth_start))s)"
+            break
+        fi
+        elapsed=$((SECONDS - auth_start))
+        if [ "$elapsed" -ge "$auth_wait" ]; then
+            scan_auth 1 || true   # final round with full failure logging
+            if [ -z "$ssh_user" ]; then
+                log "FAIL(ssh-auth): no (key, user) combination authenticated after ${elapsed}s. keys: ${sky_keys[*]}; users: ${users[*]}"
+                log "Hints: pod ssh setup may have failed, or set SKYPILOT_SSH_KEY / SKYPILOT_SSH_USER to pin. port-forward log:"
+                cat "$pf_log" >&2 2>/dev/null || true
+                exit 255
+            fi
+            printf '%s\t%s\n' "$sky_key" "$ssh_user" > "$auth_cache" 2>/dev/null || true
+            break
+        fi
+        round=$((round + 1))
+        log "auth not ready (${elapsed}s/${auth_wait}s) — pod ssh setup likely still running; retrying in 5s"
+        sleep 5
+    done
+fi
+echo "ssh_key: $sky_key" >&2
+
 MAX_WAIT_TIME_SECONDS=300
 MAX_WAIT_COUNT=$((MAX_WAIT_TIME_SECONDS * 2))
-# Use --norc --noprofile to prevent bash from sourcing startup files that might
-# output to stdout and corrupt the rsync protocol. All debug output must go to
-# stderr (>&2) to keep stdout clean for rsync communication.
-eval "${kubectl_cmd_base% --} -i -- bash --norc --noprofile -c 'count=0; until which rsync >/dev/null 2>&1; do if [ \$count -ge $MAX_WAIT_COUNT ]; then echo \"Error when trying to rsync files to kubernetes cluster. Package installation may have failed.\" >&2; exit 1; fi; sleep 0.5; count=\$((count+1)); done; exec \"\$@\"' -- \"\$@\""
+
+log "exec rsync transport: ssh ${ssh_user}@127.0.0.1:${local_port} (key: ${sky_key}), remote command: $*"
+exec ssh "${ssh_opts[@]}" -i "$sky_key" "${ssh_user}@127.0.0.1" \
+    bash --norc --noprofile -c \
+    'count=0; until command -v rsync >/dev/null 2>&1; do if [ "$count" -ge '"$MAX_WAIT_COUNT"' ]; then echo "Error when trying to rsync files to kubernetes cluster. Package installation may have failed." >&2; exit 1; fi; sleep 0.5; count=$((count+1)); done; exec "$@"' \
+    -- "$@"

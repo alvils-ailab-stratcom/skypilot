@@ -420,6 +420,22 @@ def _get_cloud_dependencies_installation_commands(
         if sc.lower() in constants.STORAGE_ONLY_CLOUDS:
             python_packages.update(dependencies.extras_require[sc.lower()])
 
+    # PATCH(stratcom): ALWAYS ship the huggingface extra to controllers.
+    # get_cached_enabled_storage_cloud_names_or_refresh() is not a cache — it
+    # does a LIVE network credential check (see its #1943 comment) in the API
+    # server process at the moment this runs. If that check flakes (no
+    # HF_TOKEN in this process, transient network, timing), 'huggingface'
+    # silently drops out of storage_clouds, the controller venv never gets
+    # huggingface_hub, and every hf:// file_mount thereafter fails on this
+    # (persistent, reused) controller with "Failed to import dependencies for
+    # Hugging Face" — observed live 2026-07-17/18. The package is small and
+    # this command's joint resolution (with the click pin below) keeps its
+    # version compatible, so install it unconditionally instead of gambling
+    # on the credential check. Scoped here (controllers only), NOT in the
+    # 'remote' extra: that would bloat every provisioned node and ride on an
+    # accidental click-pin interaction.
+    python_packages.update(dependencies.extras_require['huggingface'])
+
     # Pin click<8.3.0: typer>=0.25.0 requires click>=8.2.1 with no upper
     # bound, which lets uv resolve click to 8.3.x. click 8.3.0+ breaks Ray
     # CLI on the controller via copy.deepcopy on Click's Sentinel values.
@@ -428,10 +444,19 @@ def _get_cloud_dependencies_installation_commands(
     packages_string = ' '.join(
         [f'"{package}"' for package in sorted(python_packages)])
     step_prefix = prefix_str.replace('<step>', str(len(commands) + 1))
+    # PATCH(stratcom): fail LOUDLY. Upstream sends this install to
+    # /dev/null 2>&1 with no exit-code check, so a resolver conflict (e.g.
+    # huggingface_hub vs the click pin) silently no-ops — the controller then
+    # lacks storage deps with zero trace, and every hf:// file_mount fails
+    # later with a misleading import error (observed live 2026-07-17/18).
+    # Keep stdout quiet, but preserve stderr in a log and fail the setup step
+    # so the launch surfaces the real problem at the right moment.
     commands.append(
         f'echo -en "\\r{step_prefix}cloud python packages{empty_str}" && '
-        f'{constants.SKY_UV_PIP_CMD} install {packages_string} > /dev/null 2>&1'
-    )
+        f'{{ {constants.SKY_UV_PIP_CMD} install {packages_string} '
+        f'> /dev/null 2> /tmp/sky_controller_pkg_install.err || '
+        f'{{ echo "cloud python packages install FAILED:" >&2; '
+        f'cat /tmp/sky_controller_pkg_install.err >&2; exit 1; }}; }}')
 
     total_commands = len(commands)
     finish_prefix = prefix_str.replace('[<step>/<total>] ', '  ')

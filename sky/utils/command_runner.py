@@ -465,6 +465,16 @@ class CommandRunner:
             rsync_command.append(prefix_command)
         rsync_command += ['rsync', RSYNC_DISPLAY_OPTION]
         rsync_command.append(RSYNC_NO_OWNER_NO_GROUP_OPTION)
+        # PATCH(stratcom): io-inactivity bound. A wedged kubelet stream can
+        # stall a transfer at 0 bytes forever while the ssh transport still
+        # answers keepalives (observed 2026-07-16, k3s streaming path), so
+        # neither ssh ServerAlive* nor a wall-clock deadline is the right
+        # guard. rsync's own --timeout fires only when NO io happens for N
+        # seconds — a slow-but-moving transfer is never killed — and the
+        # nonzero exit feeds the existing retry loop below. '0' disables.
+        io_timeout = os.environ.get('SKYPILOT_RSYNC_IO_TIMEOUT', '120')
+        if io_timeout != '0':
+            rsync_command.append(f'--timeout={io_timeout}')
 
         # --filter
         # The source is a local path, so we need to resolve it.
@@ -1653,6 +1663,15 @@ class KubernetesCommandRunner(CommandRunner):
             skip_num_lines=skip_num_lines,
             source_bashrc=source_bashrc,
             run_in_background=run_in_background)
+        # NOTE(stratcom): do NOT wrap guarded execs with a keep-alive heartbeat.
+        # A backgrounded emitter inherits the exec's stderr, so the kubectl exec
+        # stream never reaches EOF once the real command finishes — its `trap
+        # ... kill` teardown is racy, and when it loses the race run_with_log
+        # blocks forever reading a stream nothing will close. That deadlocked
+        # controller setup (2026-07-17) and, being timing-dependent, did it only
+        # sometimes. The idle watchdog needs no help: real long-running work
+        # (e.g. a COPY-mode hf:// snapshot_download) writes its own progress to
+        # the log, which is exactly the activity signal the watchdog keys off.
         command = kubectl_base_command + [
             # It is important to use /bin/bash -c here to make sure we quote the
             # command to be run properly. Otherwise, directly appending commands
@@ -1688,14 +1707,47 @@ class KubernetesCommandRunner(CommandRunner):
             # immediately at EOF, making it impossible to detect
             # disconnection.
             kwargs.setdefault('stdin', subprocess.PIPE)
-        result = log_lib.run_with_log(' '.join(command),
-                                      log_path,
-                                      require_outputs=require_outputs,
-                                      stream_logs=stream_logs,
-                                      process_stream=process_stream,
-                                      shell=True,
-                                      executable=executable,
-                                      **kwargs)
+        # PATCH(stratcom): bound non-streaming control-plane execs. Some
+        # kubelets (kernel 7.0: athena/tsdb1) leave the exec stream open after
+        # the remote command finishes, so an un-timeout-guarded run() blocks
+        # provisioning forever. Guard only stream_logs=False execs (ray-status
+        # probe, start_ray, COPY-mode file mounts) — streaming setup steps stay
+        # unbounded. On timeout return a retryable rc=124 so callers' wait
+        # loops re-run; the hang is intermittent.
+        #
+        # Two bounds work together (see log_lib.run_with_log):
+        #   SKYPILOT_K8S_EXEC_IDLE_TIMEOUT (default 300s) — the PRIMARY bound:
+        #     kill only after this long with NO output activity on the log.
+        #     Distinguishes a genuinely wedged stream (silent -> reaped) from a
+        #     legitimately-slow-but-productive command like a COPY-mode hf://
+        #     snapshot_download of tens of GB, whose own progress output keeps
+        #     the log advancing. Chosen generously: nothing fabricates activity
+        #     on our behalf (see the no-heartbeat note above), so this must
+        #     exceed the quietest legitimate guarded exec, not merely the
+        #     chattiest. It still converts an infinite hang into a bounded,
+        #     retryable rc=124.
+        #   SKYPILOT_K8S_EXEC_TIMEOUT (default 3600s) — absolute wall-clock
+        #     backstop for a runaway that somehow keeps chattering.
+        if not stream_logs and 'timeout' not in kwargs:
+            kwargs['timeout'] = int(
+                os.environ.get('SKYPILOT_K8S_EXEC_TIMEOUT', '3600'))
+            kwargs['idle_timeout'] = int(
+                os.environ.get('SKYPILOT_K8S_EXEC_IDLE_TIMEOUT', '300'))
+        try:
+            result = log_lib.run_with_log(' '.join(command),
+                                          log_path,
+                                          require_outputs=require_outputs,
+                                          stream_logs=stream_logs,
+                                          process_stream=process_stream,
+                                          shell=True,
+                                          executable=executable,
+                                          **kwargs)
+        except subprocess.TimeoutExpired:
+            # Retryable failure — return early and skip the kubectl-based
+            # dead-pod enrichment below, which could hang the same way.
+            if require_outputs:
+                return 124, '', 'kubectl exec timed out (hung stream)'
+            return 124
         # When `kubectl exec` fails because the target pod is already gone
         # (e.g. it was OOMKilled), the bare kubectl error ("cannot exec into a
         # container in a completed pod") hides the real cause. Enrich stderr

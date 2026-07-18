@@ -171,6 +171,7 @@ def run_with_log(
     streaming_prefix: Optional[str] = None,
     log_cmd: bool = False,
     timeout: Optional[int] = None,
+    idle_timeout: Optional[int] = None,
     **kwargs,
 ) -> Union[int, Tuple[int, str, str], Tuple[int, int]]:
     """Runs a command and logs its output to a file.
@@ -299,6 +300,54 @@ def run_with_log(
                 timer = threading.Timer(timeout, _timeout_handler)
                 timer.start()
 
+            # PATCH(stratcom): idle (io-inactivity) watchdog. A wall-clock
+            # `timeout` cannot tell a legitimately-slow-but-productive command
+            # (e.g. a COPY-mode hf:// snapshot_download of tens of GB) from a
+            # genuinely wedged exec stream, so a tight bound kills the former
+            # and a loose bound lets a real wedge stall provisioning. This
+            # watchdog instead keys off OUTPUT ACTIVITY: it kills the command
+            # only after `idle_timeout` seconds with no growth of `log_path`.
+            # Pair with a remote-side heartbeat (see KubernetesCommandRunner)
+            # so a working-but-quiet command keeps the log advancing; a dead
+            # stream delivers neither output nor heartbeats and is reaped fast.
+            # Runs alongside `timeout`, which stays as an absolute backstop.
+            # NOTE(stratcom): everything below must stay INSIDE the
+            # `idle_timeout is not None` guard and use a local import. This
+            # function is inlined verbatim into the generated remote job script
+            # (~/.sky/sky_app/sky_job_*), which does not import threading — an
+            # unconditional threading.Event() here crashes every job driver
+            # with NameError (2026-07-17). The pre-existing wall-clock timer is
+            # safe only because it is likewise constructed under its own guard.
+            idle_triggered = False
+            idle_stop = None
+            idle_watchdog = None
+
+            def _idle_watchdog():
+                nonlocal idle_triggered
+                last_size = -1
+                last_change = time.time()
+                while not idle_stop.wait(min(idle_timeout, 15)):
+                    try:
+                        size = os.path.getsize(log_path)
+                    except OSError:
+                        size = last_size  # not created yet / rotated
+                    now = time.time()
+                    if size != last_size:
+                        last_size = size
+                        last_change = now
+                    elif now - last_change >= idle_timeout:
+                        idle_triggered = True
+                        subprocess_utils.kill_children_processes(proc.pid)
+                        return
+
+            if (idle_timeout is not None and log_path and
+                    log_path != os.devnull):
+                import threading as _threading  # pylint: disable=import-outside-toplevel
+                idle_stop = _threading.Event()
+                idle_watchdog = _threading.Thread(target=_idle_watchdog,
+                                                  daemon=True)
+                idle_watchdog.start()
+
             try:
                 if ctx is not None:
                     # When runs in a coroutine, always process the subprocess
@@ -319,7 +368,16 @@ def run_with_log(
             finally:
                 if timer is not None:
                     timer.cancel()
+                if idle_watchdog is not None:
+                    idle_stop.set()
+                    idle_watchdog.join(timeout=1)
 
+            # Check if the idle watchdog or the wall-clock timeout fired during
+            # stream processing. Idle first: it carries the more specific cause.
+            if idle_triggered:
+                logger.error(f'Command produced no output for {idle_timeout} '
+                             f'seconds (stream idle): {cmd}')
+                raise subprocess.TimeoutExpired(cmd, idle_timeout)
             # Check if timeout was triggered during stream processing
             if timeout_triggered:
                 logger.error(
