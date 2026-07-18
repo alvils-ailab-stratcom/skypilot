@@ -823,6 +823,7 @@ class LocalUpBody(RequestBody):
     gpus: bool = True
     name: Optional[str] = None
     port_start: Optional[int] = None
+    num_nodes: int = 1
 
 
 class LocalDownBody(RequestBody):
