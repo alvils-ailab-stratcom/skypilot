@@ -953,20 +953,24 @@ if not token:
         # alive. (Never fabricate activity — see the g-build heartbeat lesson.)
         progress_helper = '\n'.join([
             'import threading, time',
-            'def _sky_du(path):',
+            'def _sky_du(paths):',
+            '    if isinstance(paths, str):',
+            '        paths = [paths]',
             '    total = 0',
-            '    for _r, _d, _files in os.walk(path):',
-            '        for _f in _files:',
-            '            try:',
-            '                total += os.path.getsize(os.path.join(_r, _f))',
-            '            except OSError:',
-            '                pass',
+            '    for _p in paths:',
+            '        for _r, _d, _files in os.walk(_p):',
+            '            for _f in _files:',
+            '                try:',
+            '                    total += os.path.getsize(',
+            '                        os.path.join(_r, _f))',
+            '                except OSError:',
+            '                    pass',
             '    return total',
-            'def _sky_progress(path, interval=60):',
+            'def _sky_progress(paths, interval=60):',
             '    last = -1',
             '    while True:',
             '        time.sleep(interval)',
-            '        cur = _sky_du(path)',
+            '        cur = _sky_du(paths)',
             '        if cur != last:',
             '            print("[hf-sync] %d bytes materialized" % cur,',
             '                  flush=True)',
@@ -1008,16 +1012,55 @@ if not token:
                 '    shutil.rmtree(tmp_dir, ignore_errors=True)',
             ])
         else:
+            # PATCH(stratcom): NODE-LEVEL weight cache. With local_dir=...,
+            # snapshot_download stages blobs under <local_dir>/.cache — the
+            # pod's ephemeral overlay — so every replica re-downloads the full
+            # repo even on a node that served it minutes ago (weights are only
+            # per-pod; just the container image is per-node). When HF_HOME
+            # points somewhere durable (the k8s server config mounts a
+            # hostPath into task pods), download into the standard HF cache
+            # instead and hard-link/copy the snapshot into place: first launch
+            # on a node pays the network price once, every later launch
+            # materializes at disk speed. Falls back to the stock local_dir
+            # path when HF_HOME is unset or not writable (e.g. non-root task
+            # image on a root-owned hostPath).
             code = '\n'.join([
                 'import os',
+                'import shutil',
                 'from huggingface_hub import snapshot_download',
                 self._TOKEN_HELPER,
                 f'dest = os.path.expanduser({destination!r})',
                 'os.makedirs(dest, exist_ok=True)',
                 progress_helper,
-                ('threading.Thread(target=_sky_progress, args=(dest,), '
+                'hub_dir = None',
+                'cache_root = os.environ.get("HF_HOME")',
+                'if cache_root:',
+                '    _hub = os.path.join(os.path.expanduser(cache_root),',
+                '                        "hub")',
+                '    try:',
+                '        os.makedirs(_hub, exist_ok=True)',
+                '        _probe = os.path.join(_hub, ".sky_write_probe")',
+                '        open(_probe, "w").close()',
+                '        os.remove(_probe)',
+                '        hub_dir = _hub',
+                '    except OSError:',
+                '        hub_dir = None',
+                ('threading.Thread(target=_sky_progress, '
+                 'args=([dest] + ([hub_dir] if hub_dir else []),), '
                  'daemon=True).start()'),
-                (f'snapshot_download(repo_id={repo_id!r}, '
+                'if hub_dir is not None:',
+                (f'    snap = snapshot_download(repo_id={repo_id!r}, '
+                 f'repo_type={repo_type!r}, revision={revision!r}, '
+                 f'token=token)'),
+                '    def _link_or_copy(src, dst):',
+                '        try:',
+                '            os.link(os.path.realpath(src), dst)',
+                '        except OSError:',
+                '            shutil.copy2(src, dst)',
+                ('    shutil.copytree(snap, dest, dirs_exist_ok=True, '
+                 'copy_function=_link_or_copy)'),
+                'else:',
+                (f'    snapshot_download(repo_id={repo_id!r}, '
                  f'repo_type={repo_type!r}, revision={revision!r}, '
                  f'local_dir=dest, allow_patterns=None, '
                  f'token=token)'),
