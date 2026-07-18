@@ -143,17 +143,6 @@ local_ray = [
 remote = [
     GRPC,
     PROTOBUF,
-    # PATCH(stratcom): huggingface_hub on every controller/replica runtime.
-    # The runtime venv installs `skypilot[<cloud>, remote]` (constants.py
-    # SKYPILOT_WHEEL_INSTALLATION_COMMANDS) — NOT `[huggingface]` and NOT
-    # `[all]` — so hf:// file_mounts (COPY and MOUNT) fail on the serve
-    # controller with "Failed to import dependencies for Hugging Face". The
-    # upstream "install extras for enabled storage clouds" path did not fire
-    # reliably for the serve controller on this pin. `remote` is installed on
-    # EVERY controller and replica runtime, so putting the hf dep here makes
-    # hf:// serving work durably, with no per-controller pip install.
-    'huggingface_hub>=1.5; python_version>="3.10"',
-    'huggingface_hub>=1.5,<1.9; python_version<"3.10"',
 ]
 
 # NOTE: Change the templates/jobs-controller.yaml.j2 file if any of the
@@ -235,8 +224,15 @@ cloud_dependencies: Dict[str, List[str]] = {
     # batch_bucket_files / list_bucket_tree / download_bucket_files).
     # 1.9+ drops Python 3.9 support, so pin to <1.9 there while letting
     # Python 3.10+ install the latest.
+    # PATCH(stratcom): cap <1.17 — huggingface_hub 1.17.0 introduced a hard
+    # click>=8.4.0 requirement that conflicts with skypilot's click<8.2.0 base
+    # pin (and the controller's click<8.3.0 pin). Without the cap, resolution
+    # only succeeds via implicit backtracking; if the click floor ever
+    # loosens, an unbounded hf spec could resolve to 1.17+ and break installs.
+    # Keep consistent with the _HF_UV_OVERRIDE_FILE handling in
+    # sky/cloud_stores.py.
     'huggingface': [
-        'huggingface_hub>=1.5; python_version>="3.10"',
+        'huggingface_hub>=1.5,<1.17; python_version>="3.10"',
         'huggingface_hub>=1.5,<1.9; python_version<"3.10"',
     ],
     'scp': local_ray,
