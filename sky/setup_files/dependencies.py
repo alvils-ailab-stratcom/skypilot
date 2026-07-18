@@ -231,9 +231,14 @@ cloud_dependencies: Dict[str, List[str]] = {
     # loosens, an unbounded hf spec could resolve to 1.17+ and break installs.
     # Keep consistent with the _HF_UV_OVERRIDE_FILE handling in
     # sky/cloud_stores.py.
+    # NO python_version markers here: controller_utils wraps each package in
+    # DOUBLE quotes when composing the install command, so a marker's inner
+    # "3.10" quotes are eaten by the shell and uv rejects the spec (hit live
+    # 2026-07-18, first controller launch on the loud-failure build). The
+    # markers were redundant anyway — resolvers respect each release's
+    # requires-python, so Python 3.9 lands on 1.8.x by itself.
     'huggingface': [
-        'huggingface_hub>=1.5,<1.17; python_version>="3.10"',
-        'huggingface_hub>=1.5,<1.9; python_version<"3.10"',
+        'huggingface_hub>=1.5,<1.17',
     ],
     'scp': local_ray,
     'oci': ['oci'],
